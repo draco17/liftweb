@@ -136,7 +136,8 @@ object DriverType {
       case (PostgreSqlDriver.name, major, minor) if ((major == 8 && minor >= 2) || major > 8) => PostgreSqlDriver
       case (PostgreSqlDriver.name, _, _) => PostgreSqlOldDriver
       case (H2Driver.name,_,_) => H2Driver
-      case (SqlServerDriver.name,_,_) => SqlServerDriver
+      case (SqlServerDriver.name,major,_) if major >= 9 => SqlServerDriver
+      case (SqlServerDriver.name,_,_) => SqlServerPre2005Driver
       case (OracleDriver.name,_,_) => OracleDriver
       case (MaxDbDriver.name,_,_) => MaxDbDriver
       case x => throw new Exception(
@@ -291,10 +292,10 @@ object PostgreSqlOldDriver extends BasePostgreSQLDriver {
 }
 
 
-object SqlServerDriver extends DriverType("Microsoft SQL Server") {
-  def binaryColumnType = "VARBINARY(MAX)"
+abstract class SqlServerBaseDriver extends DriverType("Microsoft SQL Server") {
+  def binaryColumnType = "IMAGE"
   def booleanColumnType = "BIT"
-  def clobColumnType = "VARCHAR(MAX)"
+  def clobColumnType = "NTEXT"
   def dateTimeColumnType = "DATETIME"
   def dateColumnType = "DATE"
   def timeColumnType = "TIME"
@@ -308,6 +309,16 @@ object SqlServerDriver extends DriverType("Microsoft SQL Server") {
   def doubleColumnType = "FLOAT"
 
   override def defaultSchemaName : Box[String] = Full("dbo")
+}
+
+/**
+ * Microsoft SQL Server driver for versions 2000 and below
+ */
+object SqlServerPre2005Driver extends SqlServerBaseDriver
+
+object SqlServerDriver extends SqlServerBaseDriver {
+  override def binaryColumnType = "VARBINARY(MAX)"
+  override def clobColumnType = "NVARCHAR(MAX)"
 }
 
 /**
