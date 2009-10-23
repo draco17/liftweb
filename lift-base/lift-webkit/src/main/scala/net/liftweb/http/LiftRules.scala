@@ -41,7 +41,7 @@ object LiftRules extends Factory {
   type SnippetPF = PartialFunction[List[String], NodeSeq => NodeSeq]
   type LiftTagPF = PartialFunction[(String, Elem, MetaData, NodeSeq, String), NodeSeq]
   type URINotFoundPF = PartialFunction[(Req, Box[Failure]), LiftResponse]
-  type URLDecoratorPF = PartialFunction[String, Strinresg]
+  type URLDecoratorPF = PartialFunction[String, String]
   type SnippetDispatchPF = PartialFunction[String, DispatchSnippet]
   type ViewDispatchPF = PartialFunction[List[String], Either[() => Box[NodeSeq], LiftView]]
   type HttpAuthProtectedResourcePF = PartialFunction[ParsePath, Box[Role]]
@@ -587,7 +587,7 @@ object LiftRules extends Factory {
   /**
    * Computes the Comet path by adding additional tokens on top of cometPath
    */
-  var calcCometPath: String => JsExp = prefix => {
+  var calcCometPath: String => JsExp = prefix => { 
     Str(prefix + "/" + cometPath + "/") +
     JsRaw("Math.floor(Math.random() * 100000000000)") +
     Str(S.session.map(s => S.encodeURL("/"+s.uniqueId)) openOr "")

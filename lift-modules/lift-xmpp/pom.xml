@@ -37,6 +37,11 @@
       </exclusions>
     </dependency>
     <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>lift-actor</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
       <groupId>org.igniterealtime.smack</groupId>
       <artifactId>smackx</artifactId>
       <version>3.1.0</version>

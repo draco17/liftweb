@@ -1,7 +1,7 @@
 package net.liftweb.amqp
 
 import _root_.com.rabbitmq.client._
-import _root_.scala.actors.Actor
+import _root_.net.liftweb.actor._
 import _root_.java.io.ObjectInputStream
 import _root_.java.io.ByteArrayInputStream
 import _root_.java.util.Timer
@@ -10,7 +10,7 @@ import _root_.java.util.TimerTask
 /**
  * @param a The actor to add as a Listener to this Dispatcher.
  */
-case class AMQPAddListener(a: Actor)
+case class AMQPAddListener(a: LiftActor)
 
 /**
  * @param message A deserialized value received via AMQP.
@@ -40,12 +40,13 @@ case class AMQPReconnect(delay: Long)
  *
  * @author Steve Jenson (stevej@pobox.com)
  */
-abstract class AMQPDispatcher[T](cf: ConnectionFactory, host: String, port: Int) extends Actor {
+abstract class AMQPDispatcher[T](cf: ConnectionFactory, host: String, port: Int) extends LiftActor {
   var (conn, channel) = connect()
+  private var as: List[LiftActor] = Nil
 
   private def connect(): (Connection, Channel) = {
-    conn = cf.newConnection(host, port)
-    channel = conn.createChannel()
+    val conn = cf.newConnection(host, port)
+    val channel = conn.createChannel()
     configure(channel)
     (conn, channel)
   }
@@ -55,42 +56,39 @@ abstract class AMQPDispatcher[T](cf: ConnectionFactory, host: String, port: Int)
    */
   def configure(channel: Channel)
 
-  def act = loop(Nil)
-
   private val reconnectTimer = new Timer("AMQPReconnectTimer")
 
-  def loop(as: List[Actor]) {
-    react {
-      case AMQPAddListener(a) => loop(a :: as)
-      case msg@AMQPMessage(t) => as.foreach(_ ! msg); loop(as)
-      case AMQPReconnect(delay: Long) => {
-	try {
-	  val details = connect()
-	  conn = details._1
-	  channel = details._2
-	  println("AMQPDispatcher: Successfully reconnected to AMQP Server")
-	} catch {
-	  // Attempts to reconnect again using geometric back-off.
-	  case e: Exception => {
-	    val amqp = this
-	    println("AMQPDispatcher: Will attempt reconnect again in " + (delay * 2) + "ms.")
-	    reconnectTimer.schedule(new TimerTask() {
-	      override def run = {
-		amqp ! AMQPReconnect(delay * 2)
-	      }}, delay)
-	  }
+  protected def messageHandler = {
+    case AMQPAddListener(a) => as ::= a
+
+    case msg@AMQPMessage(t) => as.foreach(_ ! msg)
+
+    case AMQPReconnect(delay: Long) => 
+      try {
+	val details = connect()
+	conn = details._1
+	channel = details._2
+	println("AMQPDispatcher: Successfully reconnected to AMQP Server")
+      } catch {
+	// Attempts to reconnect again using geometric back-off.
+	case e: Exception => {
+	  val amqp = this
+	  println("AMQPDispatcher: Will attempt reconnect again in " + (delay * 2) + "ms.")
+	  reconnectTimer.schedule(new TimerTask() {
+	    override def run = {
+	      amqp ! AMQPReconnect(delay * 2)
+	    }}, delay)
 	}
-	loop(as)
       }
-      case _ => loop(as)
-    }
+
+      case _ => 
   }
 }
 
 /**
  *
  */
-class SerializedConsumer[T](channel: Channel, a: Actor) extends DefaultConsumer(channel) {
+class SerializedConsumer[T](channel: Channel, a: LiftActor) extends DefaultConsumer(channel) {
   override def handleDelivery(tag: String, env: Envelope, props: AMQP.BasicProperties, body: Array[Byte]) {
     val routingKey = env.getRoutingKey
     val contentType = props.contentType
@@ -136,17 +134,14 @@ class ExampleStringAMQPListener {
   val factory = new ConnectionFactory(params)
   // thor.local is a machine on your network with rabbitmq listening on port 5672
   val amqp = new ExampleSerializedAMQPDispatcher[String](factory, "thor.local", 5672)
-  amqp.start
 
   // Example Listener that just prints the String it receives.
-  class StringListener extends Actor {
-    def act = {
-      react {
-	case msg@AMQPMessage(contents: String) => println("received: " + msg); act
-      }
+
+  val stringListener = new LiftActor {
+    protected def messageHandler = {
+      case msg@AMQPMessage(contents: String) => println("received: " + msg)
     }
   }
-  val stringListener = new StringListener()
-  stringListener.start
+  
   amqp ! AMQPAddListener(stringListener)
 }

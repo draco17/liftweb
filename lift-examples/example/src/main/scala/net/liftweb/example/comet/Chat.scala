@@ -15,11 +15,10 @@
  */
 package net.liftweb.example.comet
 
-import _root_.scala.actors._
-import Actor._
 import _root_.net.liftweb._
 import http._
 import common._
+import actor._
 import util._
 import Helpers._
 import _root_.scala.xml._

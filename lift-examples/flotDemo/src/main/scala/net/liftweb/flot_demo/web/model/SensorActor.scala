@@ -2,12 +2,10 @@ package net.liftweb.flot_demo.web.model
 
 import scala.collection.mutable.{HashMap, HashSet}
 
-import scala.actors.Actor
-import scala.actors.Actor._
-
 import net.liftweb.widgets.flot._
 import net.liftweb.common._
 import net.liftweb.util._
+import net.liftweb.actor._
 
 /*
  * This examples simulates a sampling device that takes every 2 seconds different measures.
@@ -28,15 +26,15 @@ case class Sample (time: Long, measures: List[Double]) {
 
 //
 
-case class AddListener(listener: Actor)
+case class AddListener(listener: LiftActor)
 
-case class RemoveListener(listener: Actor)
+case class RemoveListener(listener: LiftActor)
 
 /**
  * can a "window" of samples in memory
  */
 
-class AcumSamplesActor (max : Int) extends Actor {
+class AcumSamplesActor (max : Int) extends LiftActor {
 
   val options = new FlotOptions () {
         override val xaxis = Full (new FlotAxisOptions () {
@@ -60,46 +58,41 @@ class AcumSamplesActor (max : Int) extends Actor {
     Nil
 
   // listeners
-  var listeners: List[Actor] = Nil
+  var listeners: List[LiftActor] = Nil
 
   def notifyListeners (newData : FlotNewData) = {
     listeners.foreach(_ ! newData)
   }
 
 
-  def act() = {
-    loop {
-      react {
-
+  protected def messageHandler = {
         // nueva Sample
-        case sample : Sample => {
-
-          // actualiza series flot
-          val seq = for (z <- series zip sample.measures) yield {
-            new FlotSerie () {
-              override val label = z._1.label
-              override val data = z._1.data.takeRight (max) ::: List ((0.0 + sample.time, z._2))
-              }
-            }
-
-          series = seq.toList
-
-          val newDatas = (for (medida <- sample.measures) yield (0.0 + sample.time, medida)).toList
-
-          // send the new sampling values to the listener
-          notifyListeners (FlotNewData (series, newDatas))
+    case sample : Sample => {
+      
+      // actualiza series flot
+      val seq = for (z <- series zip sample.measures) yield {
+        new FlotSerie () {
+            override val label = z._1.label
+          override val data = z._1.data.takeRight (max) ::: List ((0.0 + sample.time, z._2))
         }
-
-        case AddListener(listener: Actor) =>
-          listeners = listener :: listeners
-          //
-          reply (FlotInfo ("", series, options))
-
-
-        case RemoveListener(listener: Actor) =>
-          listeners = listeners.remove(listener.eq)
-      }
+	}
+      
+      series = seq.toList
+      
+	val newDatas = (for (medida <- sample.measures) yield (0.0 + sample.time, medida)).toList
+      
+      // send the new sampling values to the listener
+	notifyListeners (FlotNewData (series, newDatas))
     }
+    
+    case AddListener(listener: LiftActor) =>
+      listeners = listener :: listeners
+    //
+    reply (FlotInfo ("", series, options))
+    
+    
+      case RemoveListener(listener: LiftActor) =>
+        listeners = listeners.remove(listener.eq)
   }
 }
 
@@ -109,8 +102,6 @@ object Sensor extends _root_.java.lang.Runnable {
   val acum = new AcumSamplesActor (10)
 
   def start () = {
-    acum.start
-
     new Thread (this).start
   }
 

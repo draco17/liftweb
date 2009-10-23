@@ -15,8 +15,7 @@ import _root_.org.jivesoftware.smack.XMPPException
 import _root_.org.jivesoftware.smack.packet.Message
 import _root_.org.jivesoftware.smack.packet.Presence
 import _root_.org.jivesoftware.smack.util.StringUtils
-import _root_.scala.actors.Actor
-import _root_.scala.actors.Actor._
+import _root_.net.liftweb.actor._
 import _root_.scala.collection.mutable.HashMap
 import _root_.scala.collection.mutable.Map
 
@@ -40,7 +39,7 @@ case class RecvMsg(chat: Chat, msg: Message)
 case class BulkMsg(chat: Chat, msg: List[Message])
 
 // A RosterListener that sends events to the Actor given.
-abstract class DispatchRosterListener(val dispatch: Actor) extends RosterListener
+abstract class DispatchRosterListener(val dispatch: LiftActor) extends RosterListener
 
 /**
 * An XMPP Dispatcher connects to an XMPP server on behalf of a User.
@@ -51,7 +50,7 @@ abstract class DispatchRosterListener(val dispatch: Actor) extends RosterListene
 *              by logging in.
 * @author Steve Jenson (stevej@pobox.com)
 */
-class XMPPDispatcher(val connf: () => ConnectionConfiguration, val login: XMPPConnection => Unit) extends Actor {
+class XMPPDispatcher(val connf: () => ConnectionConfiguration, val login: XMPPConnection => Unit) extends LiftActor {
   val conn = new XMPPConnection(connf())
   conn.connect
   login(conn)
@@ -90,33 +89,36 @@ class XMPPDispatcher(val connf: () => ConnectionConfiguration, val login: XMPPCo
     }
   })
 
-  def act = loop(Nil)
+  private var clients: List[LiftActor] = Nil
 
-  def loop(clients: List[Actor]) {
-    react {
+  protected def messageHandler = {
       /* These are all messages we process from the client Actors. */
-      case AddListener(actor: Actor) => {
+      case AddListener(actor: LiftActor) => 
         actor ! NewRoster(roster)
-        loop(actor :: clients)
-      }
-      case RemoveListener(actor: Actor) => loop(clients.remove(_ == actor))
-      case SetPresence(presence) => conn.sendPacket(presence); loop(clients)
+	clients ::= actor
+
+      case RemoveListener(actor: LiftActor) => 
+	clients -= actor
+
+      case SetPresence(presence) => conn.sendPacket(presence)
+    
       case GetPendingMsg(to) => pendingMsg.getOrElse(to, Nil) match {
-        case Nil => pendingMsg -= to; loop(clients)
+        case Nil => pendingMsg -= to
         case xs: List[Message] => {
           pendingMsg -= to;
-          clients.foreach(_ ! BulkMsg(chats.getOrElse(to, null), xs)); loop(clients)
+          clients.foreach(_ ! BulkMsg(chats.getOrElse(to, null), xs))
         }
-        case _ => loop(clients)
+        case _ => 
       }
+
       case CreateChat(to) => {
         val chat: Chat = conn.getChatManager().createChat(to, md)
         chats += (to -> chat)
         clients.foreach(_ ! NewChat(chat))
-        loop(clients)
       }
+
       // Send a Message to the XMPP Server
-      case SendMsg(to, message) => {
+      case SendMsg(to, message) => 
         val msg = new Message(to, Message.Type.chat)
         msg.setBody(message)
         // If there isn't an existing chat in chats, make one and put it there.
@@ -128,16 +130,15 @@ class XMPPDispatcher(val connf: () => ConnectionConfiguration, val login: XMPPCo
             chat.sendMessage(msg)
           }
         }
-        loop(clients)
-      }
-      case CloseChat(to) => chats -= to; loop(clients)
+
+      case CloseChat(to) => chats -= to
 
       /* From here on are Messages we process from the XMPP server */
-      case r@RosterEntriesDeleted(_) => clients.foreach(_ ! r); loop(clients)
-      case r@RosterEntriesUpdated(_) => clients.foreach(_ ! r); loop(clients)
-      case r@RosterEntriesAdded(_) => clients.foreach(_ ! r); loop(clients)
-      case r@RosterPresenceChanged(_) => clients.foreach(_ ! r); loop(clients)
-      case c@NewChat(chat) => clients.foreach(_ ! c); loop(clients)
+      case r@RosterEntriesDeleted(_) => clients.foreach(_ ! r)
+      case r@RosterEntriesUpdated(_) => clients.foreach(_ ! r)
+      case r@RosterEntriesAdded(_) => clients.foreach(_ ! r)
+      case r@RosterPresenceChanged(_) => clients.foreach(_ ! r)
+      case c@NewChat(chat) => clients.foreach(_ ! c)
       // A new Chat has come in from the XMPP server
       case m@RecvMsg(chat, msg) => {
         // If this is starting a new chat, then it won't be in the
@@ -150,21 +151,21 @@ class XMPPDispatcher(val connf: () => ConnectionConfiguration, val login: XMPPCo
           case _ => {}
         }
         clients.foreach(_ ! RecvMsg(chat, msg))
-        loop(clients)
-      }
-      case a => loop(clients)
-    }
-  }
 
+      }
+      case a => 
+  }
+  
   // Accepts messages from XMPP and sends them to the local actor for dispatching.
-  class MessageDispatcher(dispatch: Actor) extends MessageListener {
+  class MessageDispatcher(dispatch: LiftActor) extends MessageListener {
     def processMessage(chat: Chat, msg: Message) {
       dispatch ! RecvMsg(chat, msg)
     }
   }
 }
-case class AddListener(actor: Actor)
-case class RemoveListener(actor: Actor)
+
+case class AddListener(actor: LiftActor)
+case class RemoveListener(actor: LiftActor)
 case object Start
 
 
@@ -174,31 +175,25 @@ case object Start
 * @param username is the username to login to at Google Talk: format: something@gmail.com
 * @param password is the password for the user account at Google Talk.
 */
-class ConsoleChatActor(val username: String, val password: String) extends Actor {
+class ConsoleChatActor(val username: String, val password: String) extends LiftActor {
   def connf() = new ConnectionConfiguration("talk.google.com", 5222, "gmail.com")
   def login(conn: XMPPConnection) = conn.login(username, password)
   val xmpp = new XMPPDispatcher(connf, login)
-  xmpp.start
 
   val chats: Map[String, List[Message]] = new HashMap[String, List[Message]]
   val rosterMap: HashMap[String, Presence] = new HashMap[String, Presence]
   var roster: Roster = null
 
-  def act = loop
-  def loop {
-    react {
+  protected def messageHandler = {
       case Start => {
         xmpp ! AddListener(this)
         xmpp ! SetPresence(new Presence(Presence.Type.available))
-        loop
       }
       case NewChat(c) => {
         chats += (c.getParticipant -> Nil)
-        loop
       }
       case RecvMsg(chat, msg) => {
         println("RecvMsg from: " + msg.getFrom + ": " + msg.getBody);
-        loop
       }
       case NewRoster(r) => {
         println("getting a new roster: " + r)
@@ -208,7 +203,6 @@ class ConsoleChatActor(val username: String, val password: String) extends Actor
           val user: String = entry.asInstanceOf[RosterEntry].getUser
           rosterMap += (user -> r.getPresence(user))
         }
-        loop
       }
       case RosterPresenceChanged(p) => {
         val user = StringUtils.parseBareAddress(p.getFrom)
@@ -217,22 +211,18 @@ class ConsoleChatActor(val username: String, val password: String) extends Actor
         // multiple presences can exist for one user and the roster knows which one
         // has priority.
         rosterMap += (user -> roster.getPresence(user))
-        loop
       }
-      case RosterEntriesDeleted(e) => {
+    case RosterEntriesDeleted(e) => {
         println(e)
-        loop
       }
-      case RosterEntriesUpdated(e) => {
+    case RosterEntriesUpdated(e) => {
         println(e)
-        loop
       }
-      case RosterEntriesAdded(e) => {
+    case RosterEntriesAdded(e) => {
         println(e)
-        loop
       }
-      case a => println(a); loop
-    }
+    case a => println(a)
+
   }
 
   def createChat(to: String) {
@@ -258,7 +248,7 @@ object ConsoleChatHelper {
   */
   def run(u: String, p: String) = {
     val ex = new ConsoleChatActor(u, p)
-    ex.start
+
     ex ! Start
     ex
   }
