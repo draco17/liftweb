@@ -72,22 +72,22 @@ class ThreadGlobal[T]
 }
 
 trait DynoVar[T] {
-  private val threadLocal = new ThreadLocal[Box[T]]
-  threadLocal.set(Empty)
+  private val threadLocal = new ThreadLocal[T]
+  // threadLocal.set(Empty)
 
-  def is: Box[T] = threadLocal.get
+  def is: Box[T] = Box !! threadLocal.get
 
   def get = is
 
   def set(v: T): this.type = {
-    threadLocal.set(Full(v))
+    threadLocal.set(v)
     this
   }
 
   def run[S](x: T)(f: => S): S = {
     val original = threadLocal.get
     try {
-      threadLocal.set(Full(x))
+      threadLocal.set(x)
       f
     } finally {
       threadLocal.set(original)

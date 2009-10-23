@@ -16,14 +16,15 @@ package net.liftweb.mapper
  * and limitations under the License.
  */
 
-import _root_.java.sql.{Connection, ResultSet, Statement, PreparedStatement, Types, ResultSetMetaData}
-import _root_.javax.sql.{ DataSource}
+import _root_.javax.sql.{DataSource}
 import _root_.javax.naming.{Context, InitialContext}
 import _root_.scala.collection.mutable._
 import _root_.net.liftweb.util._
 import _root_.net.liftweb.common._
 import _root_.net.liftweb.http._
 import Helpers._
+import java.sql.ResultSetMetaData
+import java.sql.{Statement, ResultSet, Types, PreparedStatement, Connection, DriverManager}
 
 object DB {
   private val threadStore = new ThreadLocal[HashMap[ConnectionIdentifier, ConnectionHolder]]
@@ -33,7 +34,7 @@ object DB {
 
   var queryTimeout: Box[Int] = Empty
 
-  type LogFunc = (DBLog,Long) => Any
+  type LogFunc = (DBLog, Long) => Any
   private var logFuncs: List[LogFunc] = Nil
 
   def addLogFunc(f: LogFunc): List[LogFunc] = {
@@ -41,7 +42,7 @@ object DB {
     logFuncs
   }
 
-  def loggingEnabled_? = ! logFuncs.isEmpty
+  def loggingEnabled_? = !logFuncs.isEmpty
 
   /**
    * can we get a JDBC connection from JNDI?
@@ -68,7 +69,7 @@ object DB {
 
   case class ConnectionHolder(conn: SuperConnection, cnt: Int, postCommit: List[() => Unit])
 
-  private def info : HashMap[ConnectionIdentifier, ConnectionHolder] = {
+  private def info: HashMap[ConnectionIdentifier, ConnectionHolder] = {
     threadStore.get match {
       case null =>
         val tinfo = new HashMap[ConnectionIdentifier, ConnectionHolder]
@@ -80,76 +81,93 @@ object DB {
   }
 
   // remove thread-local association
-  def clearThread: Unit = {
-    val i = info
-    val ks = i.keySet
+  private def clearThread(success: Boolean): Unit = {
+    val ks = info.keySet
     if (ks.isEmpty)
-    threadStore.remove
+      threadStore.remove
     else {
-      ks.foreach(n => releaseConnectionNamed(n, true))
-      clearThread
+      ks.foreach(n => releaseConnectionNamed(n, !success))
+      clearThread(success)
     }
   }
 
-  private def newConnection(name : ConnectionIdentifier) : SuperConnection = {
+  private def newConnection(name: ConnectionIdentifier): SuperConnection = {
     val ret = (Box(connectionManagers.get(name)).flatMap(cm => cm.newSuperConnection(name) or cm.newConnection(name).map(c => new SuperConnection(c, () => cm.releaseConnection(c))))) openOr {
       Helpers.tryo {
         val uniqueId = if (Log.isDebugEnabled) Helpers.nextNum.toString else ""
-        Log.debug("Connection ID "+uniqueId+" for JNDI connection "+name.jndiName+" opened")
+        Log.debug("Connection ID " + uniqueId + " for JNDI connection " + name.jndiName + " opened")
         val conn = envContext.get.lookup(name.jndiName).asInstanceOf[DataSource].getConnection
-        new SuperConnection(conn, () => {Log.debug("Connection ID "+uniqueId+" for JNDI connection "+name.jndiName+" closed"); conn.close})
-      } openOr {throw new NullPointerException("Looking for Connection Identifier "+name+" but failed to find either a JNDI data source "+
-                                               "with the name "+name.jndiName+" or a lift connection manager with the correct name")}
+        new SuperConnection(conn, () => {Log.debug("Connection ID " + uniqueId + " for JNDI connection " + name.jndiName + " closed"); conn.close})
+      } openOr {
+        throw new NullPointerException("Looking for Connection Identifier " + name + " but failed to find either a JNDI data source " +
+                "with the name " + name.jndiName + " or a lift connection manager with the correct name")
+      }
     }
     ret.setAutoCommit(false)
     ret
   }
+
+  private class ThreadBasedConnectionManager(connections: List[ConnectionIdentifier]) {
+    private var used: Set[ConnectionIdentifier] = Set()
+
+    def use(conn: ConnectionIdentifier): Int = if (connections.contains(conn)) {
+      used += conn
+      1
+    } else 0
+  }
+
+  private object CurrentConnectionSet extends DynoVar[ThreadBasedConnectionManager]
 
   /**
    * Build a LoanWrapper to pass into S.addAround() to make requests for
    * the DefaultConnectionIdentifier transactional for the complete HTTP request
    */
   def buildLoanWrapper(): LoanWrapper =
-  buildLoanWrapper(List(DefaultConnectionIdentifier))
+    buildLoanWrapper(List(DefaultConnectionIdentifier))
 
   /**
    * Build a LoanWrapper to pass into S.addAround() to make requests for
    * the List of ConnectionIdentifiers transactional for the complete HTTP request
    */
   def buildLoanWrapper(in: List[ConnectionIdentifier]): LoanWrapper =
-  new LoanWrapper {
-    private def doWith[T](in: List[ConnectionIdentifier], f: => T): T =
-    in match {
-      case Nil => f
-      case x :: xs => use(x)(ignore => doWith(xs, f))
-    }
-    private object DepthCnt extends RequestVar(0)
-    def apply[T](f: => T): T =
-    try {
-      DepthCnt.update(_ + 1)
-      doWith(in, f)
-    } finally {
-      DepthCnt.update(_ - 1)
-      if (DepthCnt.is == 0) clearThread
-    }
-  }
+    new LoanWrapper {
+      private object DepthCnt extends DynoVar[Boolean]
 
-  private def releaseConnection(conn : SuperConnection): Unit = conn.close
+      def apply[T](f: => T): T = if (DepthCnt.is == Full(true)) f
+      else DepthCnt.run(true) {
+        var success = false
+        CurrentConnectionSet.run(new ThreadBasedConnectionManager(in)) {
+          try {
+            val ret = f
+            success = true
+            ret
+          } finally {
+            clearThread(success)
+          }
+        }
 
-  private def getConnection(name : ConnectionIdentifier): SuperConnection =  {
-    Log.trace("Acquiring connection "+name+" On thread "+Thread.currentThread)
+      }
+    }
+
+  private def releaseConnection(conn: SuperConnection): Unit = conn.close
+
+  private def calcBaseCount(conn: ConnectionIdentifier): Int =
+    CurrentConnectionSet.is.map(_.use(conn)) openOr 0
+
+  private def getConnection(name: ConnectionIdentifier): SuperConnection = {
+    Log.trace("Acquiring connection " + name + " On thread " + Thread.currentThread)
     var ret = info.get(name) match {
-      case None => ConnectionHolder(newConnection(name), 1, Nil)
+      case None => ConnectionHolder(newConnection(name), calcBaseCount(name) + 1, Nil)
       case Some(ConnectionHolder(conn, cnt, post)) => ConnectionHolder(conn, cnt + 1, post)
     }
     info(name) = ret
-    Log.trace("Acquired connection "+name+" on thread "+Thread.currentThread+
-              " count "+ret.cnt)
+    Log.trace("Acquired connection " + name + " on thread " + Thread.currentThread +
+            " count " + ret.cnt)
     ret.conn
   }
 
   private def releaseConnectionNamed(name: ConnectionIdentifier, rollback: Boolean) {
-    Log.trace("Request to release connection: "+name+" on thread "+Thread.currentThread)
+    Log.trace("Request to release connection: " + name + " on thread " + Thread.currentThread)
     (info.get(name): @unchecked) match {
       case Some(ConnectionHolder(c, 1, post)) =>
         if (rollback) c.rollback
@@ -157,14 +175,14 @@ object DB {
         tryo(c.releaseFunc())
         info -= name
         post.reverse.foreach(f => tryo(f()))
-        Log.trace("Released connection "+name+" on thread "+Thread.currentThread)
+        Log.trace("Released connection " + name + " on thread " + Thread.currentThread)
 
       case Some(ConnectionHolder(c, n, post)) =>
-        Log.trace("Did not release connection: "+name+" on thread "+Thread.currentThread+" count "+(n - 1))
+        Log.trace("Did not release connection: " + name + " on thread " + Thread.currentThread + " count " + (n - 1))
         info(name) = ConnectionHolder(c, n - 1, post)
 
       case _ =>
-        // ignore
+    // ignore
     }
   }
 
@@ -178,19 +196,19 @@ object DB {
     }
   }
 
-  private def runLogger(logged : Statement, time : Long)  = logged match {
-    case st : DBLog => logFuncs.foreach(_(st, time))
+  private def runLogger(logged: Statement, time: Long) = logged match {
+    case st: DBLog => logFuncs.foreach(_(st, time))
     case _ => // NOP
   }
 
-  def statement[T](db : SuperConnection)(f : (Statement) => T) : T =  {
+  def statement[T](db: SuperConnection)(f: (Statement) => T): T = {
     Helpers.calcTime {
-      val st = 
-        if (loggingEnabled_?) {
-          DBLog.createStatement(db.connection)
-        } else {
-          db.createStatement
-        }
+      val st =
+      if (loggingEnabled_?) {
+        DBLog.createStatement(db.connection)
+      } else {
+        db.createStatement
+      }
 
       queryTimeout.foreach(to => st.setQueryTimeout(to))
       try {
@@ -199,35 +217,35 @@ object DB {
         st.close
       }
     } match {
-        case (time, (query, res)) => runLogger(query, time); res
+      case (time, (query, res)) => runLogger(query, time); res
     }
   }
 
-  def exec[T](db : SuperConnection, query : String)(f : (ResultSet) => T) : T = 
-      statement(db) {st =>
-        f(st.executeQuery(query))
-      }
-
+  def exec[T](db: SuperConnection, query: String)(f: (ResultSet) => T): T =
+    statement(db) {
+      st =>
+              f(st.executeQuery(query))
+    }
 
 
   private def asString(pos: Int, rs: ResultSet, md: ResultSetMetaData): String = {
     import _root_.java.sql.Types._
     md.getColumnType(pos) match {
-      case ARRAY | BINARY | BLOB | DATALINK | DISTINCT | JAVA_OBJECT | LONGVARBINARY | NULL | OTHER | REF | STRUCT | VARBINARY  => rs.getObject(pos) match {
-          case null => null
-          case s => s.toString
-        }
+      case ARRAY | BINARY | BLOB | DATALINK | DISTINCT | JAVA_OBJECT | LONGVARBINARY | NULL | OTHER | REF | STRUCT | VARBINARY => rs.getObject(pos) match {
+        case null => null
+        case s => s.toString
+      }
       case DECIMAL | NUMERIC =>
         rs.getBigDecimal(pos).toString
 
-      case BIGINT |  INTEGER | /* DECIMAL | NUMERIC | */ SMALLINT | TINYINT => rs.getLong(pos).toString
+      case BIGINT | INTEGER | /* DECIMAL | NUMERIC | */ SMALLINT | TINYINT => rs.getLong(pos).toString
       case BIT | BOOLEAN => rs.getBoolean(pos).toString
 
       case VARCHAR | CHAR | CLOB | LONGVARCHAR => rs.getString(pos)
 
       case DATE | TIME | TIMESTAMP => rs.getTimestamp(pos).toString
 
-      case DOUBLE | FLOAT | REAL  => rs.getDouble(pos).toString
+      case DOUBLE | FLOAT | REAL => rs.getDouble(pos).toString
     }
   }
 
@@ -239,21 +257,22 @@ object DB {
 
     val lb = new ListBuffer[List[String]]()
 
-    while(rs.next) {
+    while (rs.next) {
       lb += cntList.map(i => asString(i, rs, md))
     }
 
     (colNames, lb.toList)
   }
 
-/**
+  /**
    * Executes the given parameterized query string with the given parameters.
    * Parameters are substituted in order. For Date/Time types, passing a java.util.Date will result in a
    * Timestamp parameter. If you want a specific SQL Date/Time type, use the corresponding
    * java.sql.Date, java.sql.Time, or java.sql.Timestamp classes.
    */
   def runQuery(query: String, params: List[Any]): (List[String], List[List[String]]) =
-  runQuery(query, params, DefaultConnectionIdentifier)
+    runQuery(query, params, DefaultConnectionIdentifier)
+
   /**
    * Executes the given parameterized query string with the given parameters.
    * Parameters are substituted in order. For Date/Time types, passing a java.util.Date will result in a
@@ -262,28 +281,28 @@ object DB {
    */
   def runQuery(query: String, params: List[Any], connectionIdentifier: ConnectionIdentifier): (List[String], List[List[String]]) = {
     use(connectionIdentifier)(conn => prepareStatement(query, conn) {
-        ps =>
-        params.zipWithIndex.foreach {
-          case (null, idx) => ps.setNull(idx + 1, Types.VARCHAR)
-          case (i: Int, idx) => ps.setInt(idx +1, i)
-          case (l: Long, idx) => ps.setLong(idx + 1, l)
-          case (d: Double, idx) => ps.setDouble(idx + 1, d)
-          case (f: Float, idx) => ps.setFloat(idx + 1, f)
-            // Allow the user to specify how they want the Date handled based on the input type
-          case (t: _root_.java.sql.Timestamp, idx) => ps.setTimestamp(idx + 1, t)
-          case (d: _root_.java.sql.Date, idx) => ps.setDate(idx + 1, d)
-          case (t: _root_.java.sql.Time, idx) => ps.setTime(idx + 1, t)
-            /* java.util.Date has to go last, since the java.sql date/time classes subclass it. By default we
-             * assume a Timestamp value */
-          case (d: _root_.java.util.Date, idx) => ps.setTimestamp(idx + 1, new _root_.java.sql.Timestamp(d.getTime))
-          case (b: Boolean, idx) => ps.setBoolean(idx + 1, b)
-          case (s: String, idx) => ps.setString(idx + 1, s)
-          case (bn: _root_.java.math.BigDecimal, idx) => ps.setBigDecimal(idx + 1, bn)
-          case (obj, idx) => ps.setObject(idx + 1, obj)
-        }
+      ps =>
+              params.zipWithIndex.foreach {
+                case (null, idx) => ps.setNull(idx + 1, Types.VARCHAR)
+                case (i: Int, idx) => ps.setInt(idx + 1, i)
+                case (l: Long, idx) => ps.setLong(idx + 1, l)
+                case (d: Double, idx) => ps.setDouble(idx + 1, d)
+                case (f: Float, idx) => ps.setFloat(idx + 1, f)
+                // Allow the user to specify how they want the Date handled based on the input type
+                case (t: _root_.java.sql.Timestamp, idx) => ps.setTimestamp(idx + 1, t)
+                case (d: _root_.java.sql.Date, idx) => ps.setDate(idx + 1, d)
+                case (t: _root_.java.sql.Time, idx) => ps.setTime(idx + 1, t)
+                /* java.util.Date has to go last, since the java.sql date/time classes subclass it. By default we
+           * assume a Timestamp value */
+                case (d: _root_.java.util.Date, idx) => ps.setTimestamp(idx + 1, new _root_.java.sql.Timestamp(d.getTime))
+                case (b: Boolean, idx) => ps.setBoolean(idx + 1, b)
+                case (s: String, idx) => ps.setString(idx + 1, s)
+                case (bn: _root_.java.math.BigDecimal, idx) => ps.setBigDecimal(idx + 1, bn)
+                case (obj, idx) => ps.setObject(idx + 1, obj)
+              }
 
-        resultSetTo(ps.executeQuery)
-      })
+              resultSetTo(ps.executeQuery)
+    })
   }
 
   def runQuery(query: String): (List[String], List[List[String]]) = {
@@ -295,10 +314,10 @@ object DB {
   def rollback(name: ConnectionIdentifier) = use(name)(conn => conn.rollback)
 
   /**
-   * Executes {@code statement} and converts the {@code ResultSet} to model
-   * instance {@code T} using {@code f}
+   * Executes  { @code statement } and converts the  { @code ResultSet } to model
+   * instance  { @code T } using  { @code f }
    */
-  def exec[T](statement : PreparedStatement)(f : (ResultSet) => T) : T = {
+  def exec[T](statement: PreparedStatement)(f: (ResultSet) => T): T = {
     queryTimeout.foreach(to => statement.setQueryTimeout(to))
     Helpers.calcTime {
       val rs = statement.executeQuery
@@ -307,7 +326,10 @@ object DB {
       } finally {
         statement.close
         rs.close
-      }} match {case (time, (query, res)) => runLogger(query, time); res}
+      }
+    } match {
+      case (time, (query, res)) => runLogger(query, time); res
+    }
   }
 
   /**
@@ -315,14 +337,14 @@ object DB {
    * represents a loan pattern, and will automatically handle creation and closing of the
    * PreparedStatement.
    */
-  def prepareStatement[T](statement : String, conn: SuperConnection)(f : (PreparedStatement) => T) : T = {
-    val st = 
-      if (loggingEnabled_?) {
-        DBLog.prepareStatement(conn.connection, statement)
-      } else {
-        conn.prepareStatement(statement)
-      }
-    runPreparedStatement(st)(f)    
+  def prepareStatement[T](statement: String, conn: SuperConnection)(f: (PreparedStatement) => T): T = {
+    val st =
+    if (loggingEnabled_?) {
+      DBLog.prepareStatement(conn.connection, statement)
+    } else {
+      conn.prepareStatement(statement)
+    }
+    runPreparedStatement(st)(f)
   }
 
   /**
@@ -333,13 +355,13 @@ object DB {
    * Retrieval of generated keys is controlled with the autokeys parameter, corresponding to the
    * constants defined on java.sql.Statement: RETURN_GENERATED_KEYS or NO_GENERATED_KEYS
    */
-  def prepareStatement[T](statement : String, autokeys: Int, conn: SuperConnection)(f : (PreparedStatement) => T) : T = {
+  def prepareStatement[T](statement: String, autokeys: Int, conn: SuperConnection)(f: (PreparedStatement) => T): T = {
     val st =
-      if (loggingEnabled_?) {
-        DBLog.prepareStatement(conn.connection, statement, autokeys)
-      } else {
-        conn.prepareStatement(statement, autokeys)
-      }
+    if (loggingEnabled_?) {
+      DBLog.prepareStatement(conn.connection, statement, autokeys)
+    } else {
+      conn.prepareStatement(statement, autokeys)
+    }
     runPreparedStatement(st)(f)
   }
 
@@ -350,13 +372,13 @@ object DB {
    *
    * If the driver supports it, generated keys for the given column indices can be retrieved.
    */
-  def prepareStatement[T](statement : String, autoColumns: Array[Int], conn: SuperConnection)(f : (PreparedStatement) => T) : T = {
+  def prepareStatement[T](statement: String, autoColumns: Array[Int], conn: SuperConnection)(f: (PreparedStatement) => T): T = {
     val st =
-      if (loggingEnabled_?) {
-        DBLog.prepareStatement(conn.connection, statement, autoColumns)
-      } else {
-        conn.prepareStatement(statement, autoColumns)
-      }
+    if (loggingEnabled_?) {
+      DBLog.prepareStatement(conn.connection, statement, autoColumns)
+    } else {
+      conn.prepareStatement(statement, autoColumns)
+    }
     runPreparedStatement(st)(f)
   }
 
@@ -364,20 +386,20 @@ object DB {
    * Prepares the given statement and then passes it to the given function for use. This method
    * represents a loan pattern, and will automatically handle creation and closing of the
    * PreparedStatement.
-   * 
+   *
    * If the driver supports it, generated keys for the given column names can be retrieved.
    */
-  def prepareStatement[T](statement : String, autoColumns: Array[String], conn: SuperConnection)(f : (PreparedStatement) => T) : T = {
+  def prepareStatement[T](statement: String, autoColumns: Array[String], conn: SuperConnection)(f: (PreparedStatement) => T): T = {
     val st =
-      if (loggingEnabled_?) {
-        DBLog.prepareStatement(conn.connection, statement, autoColumns)
-      } else {
-        conn.prepareStatement(statement, autoColumns)
-      }
+    if (loggingEnabled_?) {
+      DBLog.prepareStatement(conn.connection, statement, autoColumns)
+    } else {
+      conn.prepareStatement(statement, autoColumns)
+    }
     runPreparedStatement(st)(f)
   }
 
-  private def runPreparedStatement[T](st : PreparedStatement)(f : (PreparedStatement) => T) : T = {
+  private def runPreparedStatement[T](st: PreparedStatement)(f: (PreparedStatement) => T): T = {
     queryTimeout.foreach(to => st.setQueryTimeout(to))
     try {
       f(st)
@@ -387,10 +409,10 @@ object DB {
   }
 
   /**
-   * Executes function {@code f} with the connection named {@code name}. Releases the connection
+   * Executes function  { @code f } with the connection named  { @code name }. Releases the connection
    * before returning.
    */
-  def use[T](name : ConnectionIdentifier)(f : (SuperConnection) => T) : T = {
+  def use[T](name: ConnectionIdentifier)(f: (SuperConnection) => T): T = {
     val conn = getConnection(name)
     var rollback = true
     try {
@@ -403,374 +425,374 @@ object DB {
   }
 
 
-
   val reservedWords = _root_.scala.collection.immutable.HashSet.empty ++
-  List("abort" ,
-       "accept" ,
-       "access" ,
-       "add" ,
-       "admin" ,
-       "after" ,
-       "all" ,
-       "allocate" ,
-       "alter" ,
-       "analyze" ,
-       "and" ,
-       "any" ,
-       "archive" ,
-       "archivelog" ,
-       "array" ,
-       "arraylen" ,
-       "as" ,
-       "asc" ,
-       "assert" ,
-       "assign" ,
-       "at" ,
-       "audit" ,
-       "authorization" ,
-       "avg" ,
-       "backup" ,
-       "base_table" ,
-       "become" ,
-       "before" ,
-       "begin" ,
-       "between" ,
-       "binary_integer" ,
-       "block" ,
-       "body" ,
-       "boolean" ,
-       "by" ,
-       "cache" ,
-       "cancel" ,
-       "cascade" ,
-       "case" ,
-       "change" ,
-       "char" ,
-       "character" ,
-       "char_base" ,
-       "check" ,
-       "checkpoint" ,
-       "close" ,
-       "cluster" ,
-       "clusters" ,
-       "cobol" ,
-       "colauth" ,
-       "column" ,
-       "columns" ,
-       "comment" ,
-       "commit" ,
-       "compile" ,
-       "compress" ,
-       "connect" ,
-       "constant" ,
-       "constraint" ,
-       "constraints" ,
-       "contents" ,
-       "continue" ,
-       "controlfile" ,
-       "count" ,
-       "crash" ,
-       "create" ,
-       "current" ,
-       "currval" ,
-       "cursor" ,
-       "cycle" ,
-       "database" ,
-       "data_base" ,
-       "datafile" ,
-       "date" ,
-       "dba" ,
-       "debugoff" ,
-       "debugon" ,
-       "dec" ,
-       "decimal" ,
-       "declare" ,
-       "default" ,
-       "definition" ,
-       "delay" ,
-       "delete" ,
-       "delta" ,
-       "desc" ,
-       "digits" ,
-       "disable" ,
-       "dismount" ,
-       "dispose" ,
-       "distinct" ,
-       "do" ,
-       "double" ,
-       "drop" ,
-       "dump" ,
-       "each" ,
-       "else" ,
-       "elsif" ,
-       "enable" ,
-       "end" ,
-       "entry" ,
-       "escape" ,
-       "events" ,
-       "except" ,
-       "exception" ,
-       "exception_init" ,
-       "exceptions" ,
-       "exclusive" ,
-       "exec" ,
-       "execute" ,
-       "exists" ,
-       "exit" ,
-       "explain" ,
-       "extent" ,
-       "externally" ,
-       "false" ,
-       "fetch" ,
-       "file" ,
-       "float" ,
-       "flush" ,
-       "for" ,
-       "force" ,
-       "foreign" ,
-       "form" ,
-       "fortran" ,
-       "found" ,
-       "freelist" ,
-       "freelists" ,
-       "from" ,
-       "function" ,
-       "generic" ,
-       "go" ,
-       "goto" ,
-       "grant" ,
-       "group" ,
-       "having" ,
-       "identified" ,
-       "if" ,
-       "immediate" ,
-       "in" ,
-       "including" ,
-       "increment" ,
-       "index" ,
-       "indexes" ,
-       "indicator" ,
-       "initial" ,
-       "initrans" ,
-       "insert" ,
-       "instance" ,
-       "notnull", // reserved word for PostgreSQL
-       "int" ,
-       "integer" ,
-       "intersect" ,
-       "into" ,
-       "is" ,
-       "key" ,
-       "language" ,
-       "layer" ,
-       "level" ,
-       "like" ,
-       "limited" ,
-       "link" ,
-       "lists" ,
-       "lock" ,
-       "logfile" ,
-       "long" ,
-       "loop" ,
-       "manage" ,
-       "manual" ,
-       "max" ,
-       "maxdatafiles" ,
-       "maxextents" ,
-       "maxinstances" ,
-       "maxlogfiles" ,
-       "maxloghistory" ,
-       "maxlogmembers" ,
-       "maxtrans" ,
-       "maxvalue" ,
-       "min" ,
-       "minextents" ,
-       "minus" ,
-       "minvalue" ,
-       "mlslabel" ,
-       "mod" ,
-       "mode" ,
-       "modify" ,
-       "module" ,
-       "mount" ,
-       "natural" ,
-       "new" ,
-       "next" ,
-       "nextval" ,
-       "noarchivelog" ,
-       "noaudit" ,
-       "nocache" ,
-       "nocompress" ,
-       "nocycle" ,
-       "nomaxvalue" ,
-       "nominvalue" ,
-       "none" ,
-       "noorder" ,
-       "noresetlogs" ,
-       "normal" ,
-       "nosort" ,
-       "not" ,
-       "notfound" ,
-       "nowait" ,
-       "null" ,
-       "number" ,
-       "number_base" ,
-       "numeric" ,
-       "of" ,
-       "off" ,
-       "offline" ,
-       "old" ,
-       "on" ,
-       "online" ,
-       "only" ,
-       "open" ,
-       "optimal" ,
-       "option" ,
-       "or" ,
-       "order" ,
-       "others" ,
-       "out" ,
-       "own" ,
-       "package" ,
-       "parallel" ,
-       "partition" ,
-       "pctfree" ,
-       "pctincrease" ,
-       "pctused" ,
-       "plan" ,
-       "pli" ,
-       "positive" ,
-       "pragma" ,
-       "precision" ,
-       "primary" ,
-       "prior" ,
-       "private" ,
-       "privileges" ,
-       "procedure" ,
-       "profile" ,
-       "public" ,
-       "quota" ,
-       "raise" ,
-       "range" ,
-       "raw" ,
-       "read" ,
-       "real" ,
-       "record" ,
-       "recover" ,
-       "references" ,
-       "referencing" ,
-       "release" ,
-       "remr" ,
-       "rename" ,
-       "resetlogs" ,
-       "resource" ,
-       "restricted" ,
-       "return" ,
-       "reuse" ,
-       "reverse" ,
-       "revoke" ,
-       "role" ,
-       "roles" ,
-       "rollback" ,
-       "row" ,
-       "rowid" ,
-       "rowlabel" ,
-       "rownum" ,
-       "rows" ,
-       "rowtype" ,
-       "run" ,
-       "savepoint" ,
-       "schema" ,
-       "scn" ,
-       "section" ,
-       "segment" ,
-       "select" ,
-       "separate" ,
-       "sequence" ,
-       "session" ,
-       "set" ,
-       "share" ,
-       "shared" ,
-       "size" ,
-       "smallint" ,
-       "snapshot" ,
-       "some" ,
-       "sort" ,
-       "space" ,
-       "sql" ,
-       "sqlbuf" ,
-       "sqlcode" ,
-       "sqlerrm" ,
-       "sqlerror" ,
-       "sqlstate" ,
-       "start" ,
-       "statement" ,
-       "statement_id" ,
-       "statistics" ,
-       "stddev" ,
-       "stop" ,
-       "storage" ,
-       "subtype" ,
-       "successful" ,
-       "sum" ,
-       "switch" ,
-       "synonym" ,
-       "sysdate" ,
-       "system" ,
-       "tabauth" ,
-       "table" ,
-       "tables" ,
-       "tablespace" ,
-       "task" ,
-       "temporary" ,
-       "terminate" ,
-       "then" ,
-       "thread" ,
-       "time" ,
-       "to" ,
-       "tracing" ,
-       "transaction" ,
-       "trigger" ,
-       "triggers" ,
-       "true" ,
-       "truncate" ,
-       "type" ,
-       "uid" ,
-       "under" ,
-       "union" ,
-       "unique" ,
-       "unlimited" ,
-       "until" ,
-       "update" ,
-       "use" ,
-       "user" ,
-       "using" ,
-       "validate" ,
-       "values" ,
-       "varchar" ,
-       "varchar2" ,
-       "variance" ,
-       "view" ,
-       "views" ,
-       "when" ,
-       "whenever" ,
-       "where" ,
-       "while" ,
-       "with" ,
-       "work" ,
-       "write" ,
-       "xor")
+          List("abort",
+            "accept",
+            "access",
+            "add",
+            "admin",
+            "after",
+            "all",
+            "allocate",
+            "alter",
+            "analyze",
+            "and",
+            "any",
+            "archive",
+            "archivelog",
+            "array",
+            "arraylen",
+            "as",
+            "asc",
+            "assert",
+            "assign",
+            "at",
+            "audit",
+            "authorization",
+            "avg",
+            "backup",
+            "base_table",
+            "become",
+            "before",
+            "begin",
+            "between",
+            "binary_integer",
+            "block",
+            "body",
+            "boolean",
+            "by",
+            "cache",
+            "cancel",
+            "cascade",
+            "case",
+            "change",
+            "char",
+            "character",
+            "char_base",
+            "check",
+            "checkpoint",
+            "close",
+            "cluster",
+            "clusters",
+            "cobol",
+            "colauth",
+            "column",
+            "columns",
+            "comment",
+            "commit",
+            "compile",
+            "compress",
+            "connect",
+            "constant",
+            "constraint",
+            "constraints",
+            "contents",
+            "continue",
+            "controlfile",
+            "count",
+            "crash",
+            "create",
+            "current",
+            "currval",
+            "cursor",
+            "cycle",
+            "database",
+            "data_base",
+            "datafile",
+            "date",
+            "dba",
+            "debugoff",
+            "debugon",
+            "dec",
+            "decimal",
+            "declare",
+            "default",
+            "definition",
+            "delay",
+            "delete",
+            "delta",
+            "desc",
+            "digits",
+            "disable",
+            "dismount",
+            "dispose",
+            "distinct",
+            "do",
+            "double",
+            "drop",
+            "dump",
+            "each",
+            "else",
+            "elsif",
+            "enable",
+            "end",
+            "entry",
+            "escape",
+            "events",
+            "except",
+            "exception",
+            "exception_init",
+            "exceptions",
+            "exclusive",
+            "exec",
+            "execute",
+            "exists",
+            "exit",
+            "explain",
+            "extent",
+            "externally",
+            "false",
+            "fetch",
+            "file",
+            "float",
+            "flush",
+            "for",
+            "force",
+            "foreign",
+            "form",
+            "fortran",
+            "found",
+            "freelist",
+            "freelists",
+            "from",
+            "function",
+            "generic",
+            "go",
+            "goto",
+            "grant",
+            "group",
+            "having",
+            "identified",
+            "if",
+            "immediate",
+            "in",
+            "including",
+            "increment",
+            "index",
+            "indexes",
+            "indicator",
+            "initial",
+            "initrans",
+            "insert",
+            "instance",
+            "notnull", // reserved word for PostgreSQL
+            "int",
+            "integer",
+            "intersect",
+            "into",
+            "is",
+            "key",
+            "language",
+            "layer",
+            "level",
+            "like",
+            "limited",
+            "link",
+            "lists",
+            "lock",
+            "logfile",
+            "long",
+            "loop",
+            "manage",
+            "manual",
+            "max",
+            "maxdatafiles",
+            "maxextents",
+            "maxinstances",
+            "maxlogfiles",
+            "maxloghistory",
+            "maxlogmembers",
+            "maxtrans",
+            "maxvalue",
+            "min",
+            "minextents",
+            "minus",
+            "minvalue",
+            "mlslabel",
+            "mod",
+            "mode",
+            "modify",
+            "module",
+            "mount",
+            "natural",
+            "new",
+            "next",
+            "nextval",
+            "noarchivelog",
+            "noaudit",
+            "nocache",
+            "nocompress",
+            "nocycle",
+            "nomaxvalue",
+            "nominvalue",
+            "none",
+            "noorder",
+            "noresetlogs",
+            "normal",
+            "nosort",
+            "not",
+            "notfound",
+            "nowait",
+            "null",
+            "number",
+            "number_base",
+            "numeric",
+            "of",
+            "off",
+            "offline",
+            "old",
+            "on",
+            "online",
+            "only",
+            "open",
+            "optimal",
+            "option",
+            "or",
+            "order",
+            "others",
+            "out",
+            "own",
+            "package",
+            "parallel",
+            "partition",
+            "pctfree",
+            "pctincrease",
+            "pctused",
+            "plan",
+            "pli",
+            "positive",
+            "pragma",
+            "precision",
+            "primary",
+            "prior",
+            "private",
+            "privileges",
+            "procedure",
+            "profile",
+            "public",
+            "quota",
+            "raise",
+            "range",
+            "raw",
+            "read",
+            "real",
+            "record",
+            "recover",
+            "references",
+            "referencing",
+            "release",
+            "remr",
+            "rename",
+            "resetlogs",
+            "resource",
+            "restricted",
+            "return",
+            "reuse",
+            "reverse",
+            "revoke",
+            "role",
+            "roles",
+            "rollback",
+            "row",
+            "rowid",
+            "rowlabel",
+            "rownum",
+            "rows",
+            "rowtype",
+            "run",
+            "savepoint",
+            "schema",
+            "scn",
+            "section",
+            "segment",
+            "select",
+            "separate",
+            "sequence",
+            "session",
+            "set",
+            "share",
+            "shared",
+            "size",
+            "smallint",
+            "snapshot",
+            "some",
+            "sort",
+            "space",
+            "sql",
+            "sqlbuf",
+            "sqlcode",
+            "sqlerrm",
+            "sqlerror",
+            "sqlstate",
+            "start",
+            "statement",
+            "statement_id",
+            "statistics",
+            "stddev",
+            "stop",
+            "storage",
+            "subtype",
+            "successful",
+            "sum",
+            "switch",
+            "synonym",
+            "sysdate",
+            "system",
+            "tabauth",
+            "table",
+            "tables",
+            "tablespace",
+            "task",
+            "temporary",
+            "terminate",
+            "then",
+            "thread",
+            "time",
+            "to",
+            "tracing",
+            "transaction",
+            "trigger",
+            "triggers",
+            "true",
+            "truncate",
+            "type",
+            "uid",
+            "under",
+            "union",
+            "unique",
+            "unlimited",
+            "until",
+            "update",
+            "use",
+            "user",
+            "using",
+            "validate",
+            "values",
+            "varchar",
+            "varchar2",
+            "variance",
+            "view",
+            "views",
+            "when",
+            "whenever",
+            "where",
+            "while",
+            "with",
+            "work",
+            "write",
+            "xor")
 }
 
-class SuperConnection(val connection: Connection,val releaseFunc: () => Unit, val schemaName: Box[String]) {
-  def this(c: Connection, rf: () => Unit) = this(c, rf, Empty)
-  
+class SuperConnection(val connection: Connection, val releaseFunc: () => Unit, val schemaName: Box[String]) {
+  def this(c: Connection, rf: () => Unit) = this (c, rf, Empty)
+
   lazy val brokenLimit_? = driverType.brokenLimit_?
 
   def createTablePostpend: String = driverType.createTablePostpend
+
   def supportsForeignKeys_? : Boolean = driverType.supportsForeignKeys_?
 
-  lazy val driverType : DriverType = DriverType.calcDriver(connection)
+  lazy val driverType: DriverType = DriverType.calcDriver(connection)
 }
 
 object SuperConnection {
@@ -779,8 +801,11 @@ object SuperConnection {
 
 trait ConnectionIdentifier {
   def jndiName: String
-  override def toString() = "ConnectionIdentifier("+jndiName+")"
+
+  override def toString() = "ConnectionIdentifier(" + jndiName + ")"
+
   override def hashCode() = jndiName.hashCode()
+
   override def equals(other: Any): Boolean = other match {
     case ci: ConnectionIdentifier => ci.jndiName == this.jndiName
     case _ => false
@@ -789,4 +814,89 @@ trait ConnectionIdentifier {
 
 case object DefaultConnectionIdentifier extends ConnectionIdentifier {
   var jndiName = "lift"
+}
+
+
+/**
+ * The standard DB vendor.
+ * @param driverName the name of the database driver
+ * @param dbUrl the URL for the JDBC data connection
+ * @param dbUser the optional username
+ * @param dbPassword the optional db password
+ */
+class StandardDBVendor(driverName: String,
+                     dbUrl: String,
+                     dbUser: Box[String],
+                     dbPassword: Box[String]) extends ProtoDBVendor {
+  protected def createOne: Box[Connection] = try {
+    Class.forName(driverName)
+
+    val dm = (dbUser, dbPassword) match {
+      case (Full(user), Full(pwd)) =>
+        DriverManager.getConnection(dbUrl, user, pwd)
+
+      case _ => DriverManager.getConnection(dbUrl)
+    }
+
+    Full(dm)
+  } catch {
+    case e: Exception => e.printStackTrace; Empty
+  }
+}
+
+trait ProtoDBVendor extends ConnectionManager {
+  private var pool: List[Connection] = Nil
+  private var poolSize = 0
+
+  /**
+   * Override this method if you want something other than
+   * 4 connections in the pool
+   */
+  protected def maxPoolSize = 4
+
+  /**
+   * How is a connection created?
+   */
+  protected def createOne: Box[Connection]
+
+
+  /**
+   * Test the connection.  By default, setAutoCommit(false),
+   * but you can do a real query on your RDBMS to see if the connection is alive
+   */
+  protected def testConnection(conn: Connection) {
+    conn.setAutoCommit(false)
+  }
+
+  def newConnection(name: ConnectionIdentifier): Box[Connection] =
+    synchronized {
+      pool match {
+        case Nil if poolSize < maxPoolSize =>
+          val ret = createOne
+          ret.foreach(_.setAutoCommit(false))
+          poolSize = poolSize + 1
+          ret
+
+        case Nil => wait(100L); newConnection(name)
+
+        case x :: xs => try {
+          this.testConnection(x)
+          Full(x)
+        } catch {
+          case e => try {
+            pool = xs
+            poolSize = poolSize - 1
+            tryo(x.close)
+            newConnection(name)
+          } catch {
+            case e => newConnection(name)
+          }
+        }
+      }
+    }
+
+  def releaseConnection(conn: Connection): Unit = synchronized {
+    pool = conn :: pool
+    notify
+  }
 }

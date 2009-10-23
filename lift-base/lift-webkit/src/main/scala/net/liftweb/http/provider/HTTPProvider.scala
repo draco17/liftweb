@@ -57,7 +57,7 @@ trait HTTPProvider {
       }
     }
   }
-  
+
   /**
    * Executes Lift's Boot and makes necessary initializations
    */
@@ -79,7 +79,8 @@ trait HTTPProvider {
   }
 
   private def preBoot() {
-    LiftRules.dispatch.prepend(NamedPF("Classpath service") {
+    // do this stateless
+    LiftRules.statelessDispatchTable.prepend(NamedPF("Classpath service") {
         case r @ Req(mainPath :: subPath, suffx, _) if (mainPath == LiftRules.resourceServerPath) =>
           ResourceServer.findResourceInClasspath(r, r.path.wholePath.drop(1))
       })
